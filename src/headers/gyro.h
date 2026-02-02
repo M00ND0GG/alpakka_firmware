@@ -42,6 +42,12 @@ struct Gyro_struct {
     Actions actions_x_neg;
     Actions actions_y_neg;
     Actions actions_z_neg;
+    // Momentum feature variables
+    double velocity_x;  // Current velocity in pixels/second
+    double velocity_y;  // Current velocity in pixels/second
+    uint64_t last_update_time;  // Timestamp of last update in microseconds
+    bool was_engaged;
+    bool momentum_active;
 };
 
 Gyro Gyro_ (

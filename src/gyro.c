@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <pico/time.h>
 #include "button.h"
 #include "config.h"
 #include "gyro.h"
@@ -13,6 +14,20 @@
 #include "pin.h"
 #include "touch.h"
 #include "vector.h"
+#include "logging.h"
+
+// Momentum damping coefficients (exponential decay)
+// These are damping ratios - higher = faster decay
+// velocity_new = velocity_old * exp(-damping * dt)
+// Examples: 0.5 = very light damping, 5.0 = medium, 15.0 = heavy
+#define MOMENTUM_DAMPING_HORIZONTAL 4.0   // damping coefficient
+#define MOMENTUM_DAMPING_VERTICAL 7.1    // damping coefficient
+
+// Minimum velocity threshold - below this, momentum is zeroed out (pixels/second)
+#define VELOCITY_THRESHOLD 8.0
+
+// Debug flag - set to 1 to enable verbose debug output in firmware log
+#define DEBUG_MOMENTUM 0
 
 double sensitivity_multiplier;
 
@@ -84,13 +99,14 @@ void gyro_absolute_output(float value, uint8_t *actions, bool *pressed) {
     }
 }
 
-void gyro_incremental_output(double value, uint8_t *actions) {
+// Accumulate mouse movement into totals
+void gyro_incremental_output(double value, uint8_t *actions, double *total_x, double *total_y) {
     for(uint8_t i=0; i<4; i++) {
         uint8_t action = actions[i];
-        if      (action == MOUSE_X)     hid_mouse_move(value, 0);
-        else if (action == MOUSE_Y)     hid_mouse_move(0, value);
-        else if (action == MOUSE_X_NEG) hid_mouse_move(-value, 0);
-        else if (action == MOUSE_Y_NEG) hid_mouse_move(0, -value);
+        if      (action == MOUSE_X)     *total_x += value;
+        else if (action == MOUSE_Y)     *total_y += value;
+        else if (action == MOUSE_X_NEG) *total_x -= value;
+        else if (action == MOUSE_Y_NEG) *total_y -= value;
     }
 }
 
@@ -145,42 +161,166 @@ void Gyro__report_absolute(Gyro *self) {
     else        gyro_absolute_output(-x, self->actions_x_neg, &(self->pressed_x_neg));
     if (y >= 0) gyro_absolute_output( y, self->actions_y_pos, &(self->pressed_y_pos));
     else        gyro_absolute_output(-y, self->actions_y_neg, &(self->pressed_y_neg));
-    // printf("\r%6.1f %6.1f %6.1f", x*100, y*100, z*100);
+}
+
+// Apply exponential damping to velocity
+double apply_damping(double velocity, double damping_coeff, double dt_seconds) {
+    // Check if velocity is below threshold
+    if (fabs(velocity) < VELOCITY_THRESHOLD) {
+        return 0.0;
+    }
+    
+    // Apply exponential decay: v_new = v_old * exp(-damping * dt)
+    // This creates natural "friction" that's proportional to velocity
+    double decay_factor = exp(-damping_coeff * dt_seconds);
+    return velocity * decay_factor;
 }
 
 void Gyro__report_incremental(Gyro *self) {
     static double sub_x = 0;
     static double sub_y = 0;
     static double sub_z = 0;
-     // Read gyro values.
-    Vector imu_gyro = imu_read_gyro();
-    double x = imu_gyro.x * CFG_GYRO_SENSITIVITY_X * sensitivity_multiplier;
-    double y = imu_gyro.y * CFG_GYRO_SENSITIVITY_Y * sensitivity_multiplier;
-    double z = imu_gyro.z * CFG_GYRO_SENSITIVITY_Z * sensitivity_multiplier;
-    // Additional processing.
-    double t = 1.0;
-    double k = 0.5;
-    if      (x > 0 && x <  t) x =  hssnf(t, k,  x);
-    else if (x < 0 && x > -t) x = -hssnf(t, k, -x);
-    if      (y > 0 && y <  t) y =  hssnf(t, k,  y);
-    else if (y < 0 && y > -t) y = -hssnf(t, k, -y);
-    if      (z > 0 && z <  t) z =  hssnf(t, k,  z);
-    else if (z < 0 && z > -t) z = -hssnf(t, k, -z);
-    // Reintroduce subpixel leftovers.
-    x += sub_x;
-    y += sub_y;
-    z += sub_z;
-    // Round down and save leftovers.
-    sub_x = modf(x, &x);
-    sub_y = modf(y, &y);
-    sub_z = modf(z, &z);
-    // Report.
-    if (x >= 0) gyro_incremental_output( x, self->actions_x_pos);
-    else        gyro_incremental_output(-x, self->actions_x_neg);
-    if (y >= 0) gyro_incremental_output( y, self->actions_y_pos);
-    else        gyro_incremental_output(-y, self->actions_y_neg);
-    if (z >= 0) gyro_incremental_output( z, self->actions_z_pos);
-    else        gyro_incremental_output(-z, self->actions_z_neg);
+    
+    // Get current time
+    uint64_t current_time = time_us_64();
+    
+    // Calculate delta time in seconds
+    double dt_seconds = 0.0;
+    if (self->last_update_time > 0) {
+        dt_seconds = (current_time - self->last_update_time) / 1000000.0;
+    } else {
+        dt_seconds = 1.0 / CFG_TICK_FREQUENCY;
+    }
+    self->last_update_time = current_time;
+    
+    bool currently_engaged = self->is_engaged(self);
+    
+    // Determine if gyro should be active based on mode
+    bool gyro_active = false;
+    if (self->mode == GYRO_MODE_TOUCH_ON) {
+        gyro_active = currently_engaged;
+    } else if (self->mode == GYRO_MODE_TOUCH_OFF) {
+        gyro_active = !currently_engaged;
+    } else if (self->mode == GYRO_MODE_ALWAYS_ON) {
+        gyro_active = true;
+    }
+    
+    // Accumulated mouse movement for this frame (in pixels)
+    double mouse_x = 0;
+    double mouse_y = 0;
+    
+    if (gyro_active) {
+        // Gyro is active - read actual gyro values and convert to mouse movement
+        Vector imu_gyro = imu_read_gyro();
+        double x = imu_gyro.x * CFG_GYRO_SENSITIVITY_X * sensitivity_multiplier;
+        double y = imu_gyro.y * CFG_GYRO_SENSITIVITY_Y * sensitivity_multiplier;
+        double z = imu_gyro.z * CFG_GYRO_SENSITIVITY_Z * sensitivity_multiplier;
+        
+        // Additional processing.
+        double t = 1.0;
+        double k = 0.5;
+        if      (x > 0 && x <  t) x =  hssnf(t, k,  x);
+        else if (x < 0 && x > -t) x = -hssnf(t, k, -x);
+        if      (y > 0 && y <  t) y =  hssnf(t, k,  y);
+        else if (y < 0 && y > -t) y = -hssnf(t, k, -y);
+        if      (z > 0 && z <  t) z =  hssnf(t, k,  z);
+        else if (z < 0 && z > -t) z = -hssnf(t, k, -z);
+        
+        // Reintroduce subpixel leftovers.
+        x += sub_x;
+        y += sub_y;
+        z += sub_z;
+        
+        // Save the full floating point values for velocity calculation
+        double x_full = x;
+        double y_full = y;
+        double z_full = z;
+        
+        // Round down and save leftovers.
+        sub_x = modf(x, &x);
+        sub_y = modf(y, &y);
+        sub_z = modf(z, &z);
+        
+        // Convert gyro axes to mouse X/Y based on action mappings (using truncated integers)
+        if (x >= 0) gyro_incremental_output( x, self->actions_x_pos, &mouse_x, &mouse_y);
+        else        gyro_incremental_output(-x, self->actions_x_neg, &mouse_x, &mouse_y);
+        if (y >= 0) gyro_incremental_output( y, self->actions_y_pos, &mouse_x, &mouse_y);
+        else        gyro_incremental_output(-y, self->actions_y_neg, &mouse_x, &mouse_y);
+        if (z >= 0) gyro_incremental_output( z, self->actions_z_pos, &mouse_x, &mouse_y);
+        else        gyro_incremental_output(-z, self->actions_z_neg, &mouse_x, &mouse_y);
+        
+        // Calculate velocity using FULL floating point gyro values converted to mouse space
+        double mouse_x_full = 0;
+        double mouse_y_full = 0;
+        if (x_full >= 0) gyro_incremental_output( x_full, self->actions_x_pos, &mouse_x_full, &mouse_y_full);
+        else             gyro_incremental_output(-x_full, self->actions_x_neg, &mouse_x_full, &mouse_y_full);
+        if (y_full >= 0) gyro_incremental_output( y_full, self->actions_y_pos, &mouse_x_full, &mouse_y_full);
+        else             gyro_incremental_output(-y_full, self->actions_y_neg, &mouse_x_full, &mouse_y_full);
+        if (z_full >= 0) gyro_incremental_output( z_full, self->actions_z_pos, &mouse_x_full, &mouse_y_full);
+        else             gyro_incremental_output(-z_full, self->actions_z_neg, &mouse_x_full, &mouse_y_full);
+        
+        // Calculate current velocity in pixels per second (no averaging - instant velocity)
+        if (dt_seconds > 0) {
+            self->velocity_x = mouse_x_full / dt_seconds;
+            self->velocity_y = mouse_y_full / dt_seconds;
+        }
+        
+        // Momentum is not active while gyro is active
+        self->momentum_active = false;
+        
+        #if DEBUG_MOMENTUM
+        static uint32_t log_counter = 0;
+        if ((mouse_x != 0 || mouse_y != 0) && (log_counter++ % 50 == 0)) {
+            info("GYRO: Active mouse=(%.1f,%.1f) vel=(%.0f,%.0f)px/s\n", 
+                   mouse_x, mouse_y, self->velocity_x, self->velocity_y);
+        }
+        #endif
+        
+    } else {
+        // Gyro is not active
+        if (self->was_engaged != currently_engaged && !self->momentum_active) {
+            // Just transitioned - start momentum
+            self->momentum_active = true;
+            
+            #if DEBUG_MOMENTUM
+            info("MOMENTUM: START vel=(%.0f,%.0f)px/s\n", self->velocity_x, self->velocity_y);
+            #endif
+        }
+        
+        if (self->momentum_active) {
+            // Apply damping to reduce velocity
+            self->velocity_x = apply_damping(self->velocity_x, MOMENTUM_DAMPING_HORIZONTAL, dt_seconds);
+            self->velocity_y = apply_damping(self->velocity_y, MOMENTUM_DAMPING_VERTICAL, dt_seconds);
+            
+            // Calculate mouse movement from velocity
+            mouse_x = self->velocity_x * dt_seconds;
+            mouse_y = self->velocity_y * dt_seconds;
+            
+            #if DEBUG_MOMENTUM
+            static uint32_t momentum_log_counter = 0;
+            if ((mouse_x != 0 || mouse_y != 0) && (momentum_log_counter++ % 25 == 0)) {
+                info("MOMENTUM: mouse=(%.1f,%.1f) vel=(%.0f,%.0f)px/s\n", 
+                       mouse_x, mouse_y, self->velocity_x, self->velocity_y);
+            }
+            #endif
+            
+            // Stop momentum if both velocities are zero
+            if (self->velocity_x == 0 && self->velocity_y == 0) {
+                self->momentum_active = false;
+                #if DEBUG_MOMENTUM
+                info("MOMENTUM: STOP\n");
+                #endif
+            }
+        }
+    }
+    
+    // Update engagement state for next frame
+    self->was_engaged = currently_engaged;
+    
+    // Send the final mouse movement (either from gyro or from momentum)
+    if (mouse_x != 0 || mouse_y != 0) {
+        hid_mouse_move(mouse_x, mouse_y);
+    }
 }
 
 bool Gyro__is_engaged(Gyro *self) {
@@ -190,20 +330,58 @@ bool Gyro__is_engaged(Gyro *self) {
 }
 
 void Gyro__report(Gyro *self) {
+    bool is_engaged = self->is_engaged(self);
+    bool should_report = false;
+    
+    #if DEBUG_MOMENTUM
+    static bool last_engaged = false;
+    static uint8_t mode_last_logged = 255;
+    
+    // Log mode on first call or when it changes
+    if (mode_last_logged != self->mode) {
+        mode_last_logged = self->mode;
+        const char* mode_name = "UNKNOWN";
+        if (self->mode == GYRO_MODE_OFF) mode_name = "OFF";
+        else if (self->mode == GYRO_MODE_ALWAYS_ON) mode_name = "ALWAYS_ON";
+        else if (self->mode == GYRO_MODE_TOUCH_ON) mode_name = "TOUCH_ON";
+        else if (self->mode == GYRO_MODE_TOUCH_OFF) mode_name = "TOUCH_OFF";
+        else if (self->mode == GYRO_MODE_AXIS_ABSOLUTE) mode_name = "AXIS_ABSOLUTE";
+        info("GYRO: Mode = %s\n", mode_name);
+    }
+    
+    // Log engagement state changes
+    if (is_engaged != last_engaged) {
+        info("GYRO: Engagement changed: %s -> %s (mode=%d)\n", 
+             last_engaged ? "ENGAGED" : "DISENGAGED",
+             is_engaged ? "ENGAGED" : "DISENGAGED",
+             self->mode);
+        last_engaged = is_engaged;
+    }
+    #endif
+    
     if (self->mode == GYRO_MODE_TOUCH_ON) {
-        if (self->is_engaged(self)) self->report_incremental(self);
+        // Gyro active when button pressed, momentum when released
+        // Call report_incremental if: gyro active OR momentum active OR just released button
+        should_report = is_engaged || self->momentum_active || (self->was_engaged && !is_engaged);
     }
     else if (self->mode == GYRO_MODE_TOUCH_OFF) {
-        if (!self->is_engaged(self)) self->report_incremental(self);
+        // Gyro active when button NOT pressed, momentum when pressed
+        // Call report_incremental if: gyro active OR momentum active OR just pressed button
+        should_report = !is_engaged || self->momentum_active || (!self->was_engaged && is_engaged);
     }
     else if (self->mode == GYRO_MODE_ALWAYS_ON) {
-        self->report_incremental(self);
+        should_report = true;
     }
     else if (self->mode == GYRO_MODE_AXIS_ABSOLUTE) {
         self->report_absolute(self);
+        return;
     }
     else if (self->mode == GYRO_MODE_OFF) {
         return;
+    }
+    
+    if (should_report) {
+        self->report_incremental(self);
     }
 }
 
@@ -215,6 +393,15 @@ void Gyro__reset(Gyro *self) {
     self->pressed_x_neg = false;
     self->pressed_y_neg = false;
     self->pressed_z_neg = false;
+    self->velocity_x = 0;
+    self->velocity_y = 0;
+    self->last_update_time = 0;
+    self->was_engaged = false;
+    self->momentum_active = false;
+    
+    #if DEBUG_MOMENTUM
+    info("GYRO: Reset complete\n");
+    #endif
 }
 
 void Gyro__config_x(Gyro *self, double min, double max, Actions neg, Actions pos) {
@@ -263,7 +450,18 @@ Gyro Gyro_ (
     memset(gyro.actions_x_neg, 0, ACTIONS_LEN);
     memset(gyro.actions_y_neg, 0, ACTIONS_LEN);
     memset(gyro.actions_z_neg, 0, ACTIONS_LEN);
+    gyro.velocity_x = 0;
+    gyro.velocity_y = 0;
+    gyro.last_update_time = 0;
+    gyro.was_engaged = false;
+    gyro.momentum_active = false;
     gyro_update_sensitivity();
     gyro.reset(&gyro);
+    
+    #if DEBUG_MOMENTUM
+    info("GYRO: Momentum feature initialized (H=%.0f V=%.0f damping)\n", 
+         MOMENTUM_DAMPING_HORIZONTAL, MOMENTUM_DAMPING_VERTICAL);
+    #endif
+    
     return gyro;
 }
